@@ -26,6 +26,7 @@ use dalfox::cmd::scan::{self, ScanArgs};
 fn make_args() -> ScanArgs {
     ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "url".to_string(),
         format: "json".to_string(),
         targets: vec![],

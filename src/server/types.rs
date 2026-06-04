@@ -126,6 +126,8 @@ pub(crate) struct ScanOptions {
     pub(crate) skip_ast_analysis: Option<bool>,
     /// Also report outdated / known-vulnerable JS libraries (informational, CWE-1104).
     pub(crate) detect_outdated_libs: Option<bool>,
+    /// Fetch and AST-analyze same-origin <script src> bundles for DOM-XSS.
+    pub(crate) analyze_external_js: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]

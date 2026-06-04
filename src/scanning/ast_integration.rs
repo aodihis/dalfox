@@ -3,6 +3,10 @@ use std::collections::HashSet;
 
 use super::selectors;
 
+/// Per-scan caps for external script fetching.
+const MAX_EXTERNAL_SCRIPTS: usize = 10;
+const MAX_SCRIPT_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+
 /// Collect the `id` attribute of every `<script>` element in `html`.
 ///
 /// Used to teach the AST DOM analyzer that an inline call like
@@ -85,6 +89,128 @@ pub fn extract_javascript_from_html(html: &str) -> Vec<String> {
     }
 
     js_code
+}
+
+/// Collect the URLs of all same-origin `<script src="...">` elements in `html`.
+///
+/// Resolves relative paths against `base_url` and keeps only URLs whose
+/// scheme + host match `base_url`. Cross-origin scripts are silently skipped.
+/// The returned list is deduplicated.
+pub fn extract_external_script_urls(html: &str, base_url: &url::Url) -> Vec<url::Url> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    let document = Html::parse_document(html);
+    let selector = selectors::script();
+    for element in document.select(selector) {
+        let Some(src) = element.value().attr("src") else {
+            continue;
+        };
+        let src = src.trim();
+        if src.is_empty() {
+            continue;
+        }
+        let Ok(resolved) = base_url.join(src) else {
+            continue;
+        };
+        if resolved.scheme() != base_url.scheme() || resolved.host() != base_url.host() {
+            continue;
+        }
+        if seen.insert(resolved.to_string()) {
+            result.push(resolved);
+        }
+    }
+    result
+}
+
+/// Fetch the bodies of same-origin external scripts, respecting scope flags and caps.
+///
+/// * `urls`      – candidates (already same-origin, from [`extract_external_script_urls`])
+/// * `client`    – pooled reqwest client (carries timeout + proxy from the scan config)
+/// * `scan_args` – used for `--include-url` / `--exclude-url` / `--out-of-scope` filtering
+/// * `seen`      – per-scan dedup set of already-fetched script URL strings; updated in place
+///
+/// Returns `(script_url_string, js_body)` pairs for every script that was
+/// successfully fetched within the caps.
+pub async fn fetch_external_scripts(
+    urls: Vec<url::Url>,
+    client: &reqwest::Client,
+    scan_args: &crate::cmd::scan::ScanArgs,
+    seen: &mut HashSet<String>,
+) -> Vec<(String, String)> {
+    use regex::Regex;
+
+    let include_res: Vec<Regex> = scan_args
+        .include_url
+        .iter()
+        .filter_map(|p| match Regex::new(p) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("Warning: invalid --include-url regex '{p}': {e}");
+                None
+            }
+        })
+        .collect();
+    let exclude_res: Vec<Regex> = scan_args
+        .exclude_url
+        .iter()
+        .filter_map(|p| match Regex::new(p) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("Warning: invalid --exclude-url regex '{p}': {e}");
+                None
+            }
+        })
+        .collect();
+
+    let mut results = Vec::new();
+
+    for url in urls {
+        if results.len() >= MAX_EXTERNAL_SCRIPTS {
+            break;
+        }
+        let url_str = url.to_string();
+
+        if seen.contains(&url_str) {
+            continue;
+        }
+
+        // --out-of-scope: skip if host matches any pattern
+        let host = url.host_str().unwrap_or("");
+        if scan_args
+            .out_of_scope
+            .iter()
+            .any(|p| crate::cmd::scan::validation::domain_matches_pattern(host, p))
+        {
+            continue;
+        }
+
+        // --exclude-url
+        if exclude_res.iter().any(|re| re.is_match(&url_str)) {
+            continue;
+        }
+
+        // --include-url (skip if non-empty and no pattern matches)
+        if !include_res.is_empty() && !include_res.iter().any(|re| re.is_match(&url_str)) {
+            continue;
+        }
+
+        seen.insert(url_str.clone());
+
+        let Ok(resp) = client.get(url).send().await else {
+            continue;
+        };
+        let Ok(bytes) = resp.bytes().await else {
+            continue;
+        };
+        if bytes.len() > MAX_SCRIPT_BYTES {
+            continue;
+        }
+        let Ok(body) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        results.push((url_str, body.to_string()));
+    }
+    results
 }
 
 /// Generate an executable POC payload based on the source and sink

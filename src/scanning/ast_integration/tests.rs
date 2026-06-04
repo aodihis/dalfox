@@ -820,3 +820,47 @@ fn e2e_apidom_level3_xhr_innerhtml_finding() {
             .collect::<Vec<_>>()
     );
 }
+
+// --- extract_external_script_urls tests ---
+
+#[test]
+fn test_extract_external_script_urls_same_origin_only() {
+    let html = r#"
+<html><body>
+<script src="/bundle.js"></script>
+<script src="https://cdn.other.com/lib.js"></script>
+</body></html>
+"#;
+    let base = url::Url::parse("https://example.com/page").unwrap();
+    let urls = extract_external_script_urls(html, &base);
+    assert_eq!(urls.len(), 1, "cross-origin src must be filtered out");
+    assert!(urls[0].path().contains("bundle.js"));
+}
+
+#[test]
+fn test_extract_external_script_urls_dedup() {
+    let html = r#"<html><body>
+<script src="/a.js"></script>
+<script src="/a.js"></script>
+</body></html>"#;
+    let base = url::Url::parse("https://example.com/").unwrap();
+    let urls = extract_external_script_urls(html, &base);
+    assert_eq!(urls.len(), 1, "same src listed twice must be deduplicated");
+}
+
+#[test]
+fn test_extract_external_script_urls_none_when_inline_only() {
+    let html = r#"<html><body><script>var x = 1;</script></body></html>"#;
+    let base = url::Url::parse("https://example.com/").unwrap();
+    let urls = extract_external_script_urls(html, &base);
+    assert!(urls.is_empty(), "inline-only page must yield no URLs");
+}
+
+#[test]
+fn test_extract_external_script_urls_relative_resolved() {
+    let html = r#"<html><body><script src="js/app.js"></script></body></html>"#;
+    let base = url::Url::parse("https://example.com/app/").unwrap();
+    let urls = extract_external_script_urls(html, &base);
+    assert_eq!(urls.len(), 1);
+    assert_eq!(urls[0].as_str(), "https://example.com/app/js/app.js");
+}

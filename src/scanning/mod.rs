@@ -428,12 +428,34 @@ async fn run_ast_dom_analysis(
     param: &Param,
     response_text: &str,
     ast_seen: &mut HashSet<String>,
+    scan_args: &ScanArgs,
+    ext_script_seen: &mut HashSet<String>,
 ) -> Vec<crate::scanning::result::Result> {
     let mut results = Vec::new();
-    let js_blocks = crate::scanning::ast_integration::extract_javascript_from_html(response_text);
+    let mut js_blocks: Vec<(String, Option<String>)> =
+        crate::scanning::ast_integration::extract_javascript_from_html(response_text)
+            .into_iter()
+            .map(|js| (js, None))
+            .collect();
+    if scan_args.analyze_external_js {
+        let ext_urls = crate::scanning::ast_integration::extract_external_script_urls(
+            response_text,
+            &target.url,
+        );
+        let ext_scripts = crate::scanning::ast_integration::fetch_external_scripts(
+            ext_urls,
+            client,
+            scan_args,
+            ext_script_seen,
+        )
+        .await;
+        for (script_url, js_body) in ext_scripts {
+            js_blocks.push((js_body, Some(script_url)));
+        }
+    }
     let script_element_ids =
         crate::scanning::ast_integration::extract_script_element_ids(response_text);
-    for js_code in js_blocks {
+    for (js_code, script_src) in js_blocks {
         let findings =
             crate::scanning::ast_integration::analyze_javascript_for_dom_xss_with_html_context(
                 &js_code,
@@ -474,15 +496,21 @@ async fn run_ast_dom_analysis(
                 .data(result_url.clone())
                 .param(param.name.clone())
                 .payload(payload.clone())
-                .evidence(format!(
-                    "{}:{}:{} - {} (Source: {}, Sink: {})",
-                    target.url.as_str(),
-                    vuln.line,
-                    vuln.column,
-                    description,
-                    vuln.source,
-                    vuln.sink
-                ))
+                .evidence({
+                    let ext = script_src
+                        .as_deref()
+                        .map(|s| format!(" [external: {s}]"))
+                        .unwrap_or_default();
+                    format!(
+                        "{}:{}:{} - {} (Source: {}, Sink: {}){ext}",
+                        target.url.as_str(),
+                        vuln.line,
+                        vuln.column,
+                        description,
+                        vuln.source,
+                        vuln.sink,
+                    )
+                })
                 .cwe("CWE-79")
                 .severity("Medium")
                 .message_id(0)
@@ -1127,6 +1155,8 @@ struct ParamScanState {
     local_results: Vec<crate::scanning::result::Result>,
     /// AST findings already recorded for this param (dedup key set).
     ast_seen: HashSet<String>,
+    /// External script URLs already fetched this scan (dedup across params).
+    ext_script_seen: HashSet<String>,
     /// AST DOM analysis runs at most once per param.
     ast_analysis_done: bool,
     /// Reflection already confirmed for this param locally — skip the
@@ -1309,6 +1339,8 @@ impl ScanWorkerCtx {
                 param,
                 response_text,
                 &mut state.ast_seen,
+                &self.args,
+                &mut state.ext_script_seen,
             )
             .await;
             for f in &ast_findings {
@@ -1398,6 +1430,8 @@ impl ScanWorkerCtx {
                     param,
                     response_text,
                     &mut state.ast_seen,
+                    &self.args,
+                    &mut state.ext_script_seen,
                 )
                 .await;
                 for f in &ast_findings {

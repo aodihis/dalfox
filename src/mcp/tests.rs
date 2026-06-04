@@ -45,6 +45,7 @@ fn default_scan_params(target: &str) -> ScanWithDalfoxParams {
         deep_scan: false,
         skip_ast_analysis: false,
         detect_outdated_libs: false,
+        analyze_external_js: false,
         blind_callback_url: None,
         workers: 1,
     }
@@ -53,6 +54,7 @@ fn default_scan_params(target: &str) -> ScanWithDalfoxParams {
 fn default_scan_args(target: &str) -> ScanArgs {
     ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "url".to_string(),
         format: "json".to_string(),
         targets: vec![target.to_string()],

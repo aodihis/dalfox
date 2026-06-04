@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 fn default_scan_args() -> crate::cmd::scan::ScanArgs {
     crate::cmd::scan::ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "plain".to_string(),
         output: None,
@@ -144,6 +145,7 @@ fn full_scan_config() -> ScanConfig {
         sxss_retries: Some(12),
         skip_ast_analysis: Some(true),
         detect_outdated_libs: Some(true),
+        analyze_external_js: Some(false),
         hpp: Some(false),
         waf_bypass: Some("auto".to_string()),
         skip_waf_probe: Some(false),

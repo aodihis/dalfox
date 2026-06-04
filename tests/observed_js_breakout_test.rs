@@ -47,6 +47,7 @@ async fn nested_object_handler(Query(p): Query<HashMap<String, String>>) -> Html
 fn base_args(url: String, out: String) -> ScanArgs {
     ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "url".to_string(),
         format: "json".to_string(),
         targets: vec![url],

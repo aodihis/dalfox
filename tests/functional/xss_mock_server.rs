@@ -1031,6 +1031,7 @@ async fn run_scan_test(
 
     let args = ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "url".to_string(),
         format: "json".to_string(),
         targets: vec![target],
@@ -1152,6 +1153,7 @@ async fn run_discovery_once(opts: DiscoveryOpts) -> bool {
 
     let args = ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "url".to_string(),
         format: "json".to_string(),
         targets: vec![url.clone()],
@@ -2624,6 +2626,7 @@ async fn run_libscan(addr: SocketAddr, case_id: u32, detect_libs: bool) -> Vec<s
     let args = ScanArgs {
         // The opt-in outdated-library detector is gated by this flag.
         detect_outdated_libs: detect_libs,
+        analyze_external_js: false,
         input_type: "url".to_string(),
         format: "json".to_string(),
         targets: vec![target],

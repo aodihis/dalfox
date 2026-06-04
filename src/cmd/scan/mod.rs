@@ -37,7 +37,7 @@ mod poc;
 mod postprocess;
 mod preflight;
 mod scan_loop;
-mod validation;
+pub(crate) mod validation;
 
 pub use args::{
     CLI_MAX_DELAY_MS, CLI_MAX_TIMEOUT_SECS, CLI_MAX_WORKERS, DEFAULT_DELAY_MS, DEFAULT_ENCODERS,

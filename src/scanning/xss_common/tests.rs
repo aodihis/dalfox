@@ -185,6 +185,7 @@ fn test_get_dynamic_payloads_basic() {
     let context = InjectionContext::Html(None);
     let args = ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         encoders: vec!["url".to_string(), "html".to_string()],
         ..base_args()
     };
@@ -217,6 +218,7 @@ fn test_get_dynamic_payloads_only_custom() {
     let context = InjectionContext::Html(None);
     let args = ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         custom_payload: Some("test_payloads.txt".to_string()),
         only_custom_payload: true,
         ..base_args()
@@ -373,6 +375,7 @@ fn test_load_custom_payloads_caches_by_path() {
 fn base_args() -> ScanArgs {
     ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "json".to_string(),
         targets: vec![],
@@ -449,6 +452,7 @@ fn base_args() -> ScanArgs {
 fn test_get_dynamic_payloads_custom_numeric_alert_value() {
     let args = ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         custom_alert_value: "9999".to_string(),
         ..base_args()
     };
@@ -463,6 +467,7 @@ fn test_get_dynamic_payloads_custom_numeric_alert_value() {
 fn test_get_dynamic_payloads_custom_string_alert_value() {
     let args = ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         custom_alert_type: "str".to_string(),
         custom_alert_value: "xss".to_string(),
         ..base_args()

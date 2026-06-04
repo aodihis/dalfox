@@ -9,6 +9,7 @@ use crate::target_parser::parse_target;
 fn integration_scan_args(skip_xss: bool) -> crate::cmd::scan::ScanArgs {
     crate::cmd::scan::ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "json".to_string(),
         targets: vec![],
@@ -372,6 +373,7 @@ fn mock_add_reflection_param(target: &mut Target, name: &str, location: Location
 fn default_scan_args() -> crate::cmd::scan::ScanArgs {
     crate::cmd::scan::ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "json".to_string(),
         targets: vec!["https://example.com".to_string()],
@@ -858,6 +860,7 @@ async fn test_xss_scanning_get_query() {
 
     let args = crate::cmd::scan::ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "json".to_string(),
         targets: vec!["https://example.com".to_string()],
@@ -957,6 +960,7 @@ async fn test_xss_scanning_post_body() {
 
     let args = crate::cmd::scan::ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "json".to_string(),
         targets: vec!["https://example.com".to_string()],
@@ -1071,6 +1075,7 @@ async fn test_run_scanning_with_reflection_params() {
 
     let args = crate::cmd::scan::ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "json".to_string(),
         targets: vec!["https://example.com".to_string()],
@@ -1338,6 +1343,7 @@ async fn test_run_scanning_empty_params() {
 
     let args = crate::cmd::scan::ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "json".to_string(),
         targets: vec!["https://example.com".to_string()],

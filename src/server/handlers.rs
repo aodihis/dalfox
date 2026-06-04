@@ -344,6 +344,9 @@ pub(crate) async fn get_scan_handler(
     let detect_outdated_libs = params
         .get("detect_outdated_libs")
         .is_some_and(|s| s == "true");
+    let analyze_external_js = params
+        .get("analyze_external_js")
+        .is_some_and(|s| s == "true");
 
     let opts = ScanOptions {
         cookie,
@@ -379,6 +382,7 @@ pub(crate) async fn get_scan_handler(
         deep_scan: Some(deep_scan),
         skip_ast_analysis: Some(skip_ast_analysis),
         detect_outdated_libs: Some(detect_outdated_libs),
+        analyze_external_js: Some(analyze_external_js),
     };
 
     if let Err(msg) = validate_scan_options(&opts) {

@@ -117,6 +117,7 @@ pub struct ScanConfig {
     pub sxss_retries: Option<u32>,
     pub skip_ast_analysis: Option<bool>,
     pub detect_outdated_libs: Option<bool>,
+    pub analyze_external_js: Option<bool>,
     // HPP
     pub hpp: Option<bool>,
     // WAF
@@ -795,6 +796,11 @@ impl Config {
                 && !args.detect_outdated_libs
             {
                 args.detect_outdated_libs = v;
+            }
+            if let Some(v) = scan.analyze_external_js
+                && !args.analyze_external_js
+            {
+                args.analyze_external_js = v;
             }
             if let Some(v) = scan.hpp
                 && !args.hpp

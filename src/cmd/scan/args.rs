@@ -456,6 +456,13 @@ pub struct ScanArgs {
     #[arg(long)]
     pub detect_outdated_libs: bool,
 
+    #[clap(help_heading = "XSS SCANNING")]
+    /// Fetch and AST-analyze same-origin <script src> bundles for DOM-XSS
+    /// (off by default to preserve request budget; each matched bundle counts
+    /// against the per-scan cap of 10 scripts × 2 MB).
+    #[arg(long)]
+    pub analyze_external_js: bool,
+
     #[clap(help_heading = "WAF")]
     /// WAF bypass mode: auto (detect+bypass), force (use --force-waf), off (detect-only; no payload mutations). Default: auto
     #[arg(long, default_value = "auto", value_parser = clap::builder::PossibleValuesParser::new(["auto", "force", "off"]))]
@@ -520,6 +527,7 @@ impl ScanArgs {
         };
         ScanArgs {
             detect_outdated_libs: false,
+            analyze_external_js: false,
             input_type: "url".to_string(),
             format: "json".to_string(),
             targets: vec![opts.target],

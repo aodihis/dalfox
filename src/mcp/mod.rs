@@ -583,6 +583,11 @@ pub struct ScanWithDalfoxParams {
     #[serde(default)]
     pub detect_outdated_libs: bool,
 
+    /// Fetch and AST-analyze same-origin <script src> bundles for DOM-XSS.
+    /// Off by default to preserve request budget.
+    #[serde(default)]
+    pub analyze_external_js: bool,
+
     /// Blind XSS callback URL (e.g., your Burp Collaborator or interact.sh URL).
     #[serde(default)]
     pub blind_callback_url: Option<String>,
@@ -741,6 +746,7 @@ Final results (via get_results_dalfox) include finding type \
             deep_scan,
             skip_ast_analysis,
             detect_outdated_libs,
+            analyze_external_js,
             blind_callback_url,
             workers,
         } = params;
@@ -824,6 +830,7 @@ Final results (via get_results_dalfox) include finding type \
         // see the comment on `ScanWithDalfoxParams::cookies` for the reason.
         let scan_args = Arc::new(ScanArgs {
             detect_outdated_libs,
+            analyze_external_js,
             input_type: "url".to_string(),
             format: "json".to_string(),
             targets: vec![target.clone()],

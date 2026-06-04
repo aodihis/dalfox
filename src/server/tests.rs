@@ -1028,6 +1028,7 @@ async fn test_run_scan_job_success_marks_done() {
         skip_ast_analysis: None,
         // Exercise the ON path: opts -> job_runner -> ScanArgs -> analysis gate.
         detect_outdated_libs: Some(true),
+        analyze_external_js: None,
     };
 
     let run = tokio::time::timeout(

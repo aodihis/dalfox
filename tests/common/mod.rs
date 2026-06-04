@@ -11,6 +11,7 @@ use dalfox::cmd::scan::ScanArgs;
 pub fn create_test_scan_args() -> ScanArgs {
     ScanArgs {
         detect_outdated_libs: false,
+        analyze_external_js: false,
         input_type: "auto".to_string(),
         format: "json".to_string(),
         targets: vec![],

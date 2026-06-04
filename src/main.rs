@@ -351,6 +351,7 @@ async fn main() {
         // Default to scan
         let mut args = cmd::scan::ScanArgs {
             detect_outdated_libs: false,
+            analyze_external_js: false,
             input_type: "auto".to_string(),
             format: "plain".to_string(),
             targets: cli.targets,
