@@ -2812,3 +2812,190 @@ async fn test_escaped_quote_breakout_v2() {
     );
     println!("[#9201] escaped-quote breakout attributed to #1072 synthesis");
 }
+
+// --- external JS bundle DOM-XSS ---
+
+/// Page: reflects `q` into a plain div and loads an external script.
+async fn ext_js_page_handler(Query(p): Query<HashMap<String, String>>) -> Html<String> {
+    let q = p.get("q").cloned().unwrap_or_default();
+    Html(format!(
+        r#"<html><body><div id="out">{q}</div><script src="/extjs_bundle.js"></script></body></html>"#
+    ))
+}
+
+/// External bundle: `location.hash` → `innerHTML` DOM-XSS sink.
+async fn ext_js_bundle_handler(
+    State(counter): State<Arc<std::sync::atomic::AtomicUsize>>,
+) -> impl IntoResponse {
+    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+        r#"document.getElementById('out').innerHTML = location.hash;"#,
+    )
+}
+
+/// Run a scan against a local server that serves an external JS bundle.
+/// Returns the findings array from the JSON output.
+async fn run_ext_js_scan(
+    addr: SocketAddr,
+    analyze_external_js: bool,
+) -> Vec<serde_json::Value> {
+    let target = format!("http://{}:{}/?q=seed", addr.ip(), addr.port());
+    let out_path = std::env::temp_dir().join(format!(
+        "dalfox_extjs_{}_{}_{}.json",
+        analyze_external_js,
+        addr.ip(),
+        addr.port()
+    ));
+
+    let args = ScanArgs {
+        detect_outdated_libs: false,
+        analyze_external_js,
+        input_type: "url".to_string(),
+        format: "json".to_string(),
+        targets: vec![target],
+        param: vec![],
+        data: None,
+        headers: vec![],
+        cookies: vec![],
+        method: "GET".to_string(),
+        user_agent: None,
+        cookie_from_raw: None,
+        include_url: vec![],
+        exclude_url: vec![],
+        ignore_param: vec![],
+        out_of_scope: vec![],
+        out_of_scope_file: None,
+        mining_dict_word: None,
+        skip_mining: true,
+        skip_mining_dict: true,
+        skip_mining_dom: true,
+        only_discovery: false,
+        skip_discovery: false,
+        skip_reflection_header: true,
+        skip_reflection_cookie: true,
+        skip_reflection_path: true,
+        timeout: 5,
+        scan_timeout: 0,
+        delay: 0,
+        proxy: None,
+        follow_redirects: false,
+        ignore_return: vec![],
+        output: Some(out_path.to_string_lossy().to_string()),
+        include_request: false,
+        include_response: false,
+        include_all: false,
+        no_color: true,
+        silence: true,
+        dry_run: false,
+        stream_findings: false,
+        poc_type: "plain".to_string(),
+        limit: None,
+        limit_result_type: "all".to_string(),
+        only_poc: vec![],
+        workers: 4,
+        max_concurrent_targets: 4,
+        max_targets_per_host: 100,
+        encoders: vec!["url".to_string(), "html".to_string()],
+        custom_blind_xss_payload: None,
+        blind_callback_url: None,
+        custom_payload: None,
+        only_custom_payload: false,
+        inject_marker: None,
+        custom_alert_value: "1".to_string(),
+        custom_alert_type: "none".to_string(),
+        skip_xss_scanning: false,
+        max_payloads_per_param: 0,
+        deep_scan: false,
+        sxss: false,
+        sxss_url: None,
+        sxss_method: "GET".to_string(),
+        sxss_retries: 1,
+        skip_ast_analysis: false,
+        hpp: false,
+        waf_bypass: "off".to_string(),
+        skip_waf_probe: true,
+        force_waf: None,
+        waf_evasion: false,
+        waf_min_confidence: 0.0,
+        remote_payloads: vec![],
+        remote_wordlists: vec![],
+    };
+
+    scan::run_scan(&args).await;
+
+    let content = std::fs::read_to_string(&out_path).expect("scan should write JSON output");
+    let v: serde_json::Value = serde_json::from_str(&content).expect("output should be valid JSON");
+    v["findings"]
+        .as_array()
+        .expect("json should have a 'findings' array")
+        .clone()
+}
+
+/// Functional test for external `<script src>` bundle DOM-XSS analysis.
+///
+/// Flag **on**: scanner must fetch `/extjs_bundle.js` (request counter ≥ 1)
+/// and return a finding whose evidence contains `[external: …]`.
+///
+/// Flag **off**: `/extjs_bundle.js` is never fetched (counter stays 0) and
+/// no `[external:]` evidence appears.
+#[tokio::test]
+#[ignore = "functional: external JS bundle DOM-XSS detection"]
+async fn test_external_js_dom_xss() {
+    dalfox::ensure_crypto_provider();
+
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/", get(ext_js_page_handler))
+        .route("/extjs_bundle.js", get(ext_js_bundle_handler))
+        .with_state(counter.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let is_external = |f: &serde_json::Value| {
+        f.get("evidence")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("[external:"))
+    };
+
+    // Flag OFF: no fetch, no external finding.
+    let off = run_ext_js_scan(addr, false).await;
+    let off_count = counter.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        off_count, 0,
+        "/extjs_bundle.js must not be fetched when flag is off"
+    );
+    assert!(
+        !off.iter().any(is_external),
+        "flag-off scan must not produce [external:] findings; got {off:?}"
+    );
+    println!("[ext-js off] no external-JS fetch, no external finding (correct)");
+
+    // Flag ON: bundle fetched, finding with [external:] present.
+    counter.store(0, std::sync::atomic::Ordering::SeqCst);
+    let on = run_ext_js_scan(addr, true).await;
+    let on_count = counter.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        on_count > 0,
+        "/extjs_bundle.js was never fetched — analyze_external_js path did not fire"
+    );
+    let ext_finding = on.iter().find(|f| is_external(f));
+    assert!(
+        ext_finding.is_some(),
+        "expected a finding with [external: ...] in evidence; got {on:?}"
+    );
+    let evidence = ext_finding
+        .unwrap()
+        .get("evidence")
+        .and_then(|e| e.as_str())
+        .unwrap_or("");
+    assert!(
+        evidence.contains("extjs_bundle.js"),
+        "evidence should name the fetched bundle: {evidence:?}"
+    );
+    println!("[ext-js on] external-JS finding: {evidence}");
+}
