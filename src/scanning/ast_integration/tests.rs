@@ -864,3 +864,170 @@ fn test_extract_external_script_urls_relative_resolved() {
     assert_eq!(urls.len(), 1);
     assert_eq!(urls[0].as_str(), "https://example.com/app/js/app.js");
 }
+
+// ===== fetch_external_scripts: bounded-fetch and size-cap tests =====
+
+fn test_reqwest_client() -> reqwest::Client {
+    crate::ensure_crypto_provider();
+    reqwest::Client::new()
+}
+
+fn minimal_scan_args() -> crate::cmd::scan::ScanArgs {
+    use crate::cmd::scan::PreflightOptions;
+    crate::cmd::scan::ScanArgs::for_preflight(PreflightOptions {
+        target: "http://localhost".to_string(),
+        param: vec![],
+        method: "GET".to_string(),
+        data: None,
+        headers: vec![],
+        cookies: vec![],
+        user_agent: None,
+        timeout: 5,
+        proxy: None,
+        follow_redirects: false,
+        skip_mining: false,
+        skip_discovery: false,
+        encoders: vec![],
+    })
+}
+
+#[tokio::test]
+async fn test_fetch_external_scripts_count_cap() {
+    use axum::{Router, routing::get};
+    use std::net::Ipv4Addr;
+
+    let app = Router::new().route("/{*path}", get(|| async { "var x = 1;" }));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let urls: Vec<url::Url> = (0..15)
+        .map(|i| {
+            url::Url::parse(&format!("http://{addr}/script{i}.js")).unwrap()
+        })
+        .collect();
+
+    let client = test_reqwest_client();
+    let scan_args = minimal_scan_args();
+    let mut seen = std::collections::HashSet::new();
+    let results = fetch_external_scripts(urls, &client, &scan_args, &mut seen).await;
+
+    assert!(
+        results.len() <= MAX_EXTERNAL_SCRIPTS,
+        "expected at most {MAX_EXTERNAL_SCRIPTS} scripts, got {}",
+        results.len()
+    );
+    assert_eq!(
+        results.len(),
+        MAX_EXTERNAL_SCRIPTS,
+        "expected exactly {MAX_EXTERNAL_SCRIPTS} scripts fetched"
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_external_scripts_size_cap() {
+    use axum::{Router, routing::get};
+    use std::net::Ipv4Addr;
+
+    // Serve a body one byte over the size cap — must be skipped.
+    let oversized = "x".repeat(MAX_SCRIPT_BYTES + 1);
+    let app = Router::new().route(
+        "/big.js",
+        get(move || {
+            let body = oversized.clone();
+            async move { body }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let urls = vec![url::Url::parse(&format!("http://{addr}/big.js")).unwrap()];
+    let client = test_reqwest_client();
+    let scan_args = minimal_scan_args();
+    let mut seen = std::collections::HashSet::new();
+    let results = fetch_external_scripts(urls, &client, &scan_args, &mut seen).await;
+
+    assert!(
+        results.is_empty(),
+        "script body over {MAX_SCRIPT_BYTES} bytes must be skipped, got {} result(s)",
+        results.len()
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_external_scripts_exclude_url() {
+    use axum::{Router, routing::get};
+    use std::net::Ipv4Addr;
+
+    let app = Router::new().route("/{*path}", get(|| async { "var x = 1;" }));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    // Two scripts: vendor.js (excluded) and app.js (allowed)
+    let urls = vec![
+        url::Url::parse(&format!("http://{addr}/vendor.js")).unwrap(),
+        url::Url::parse(&format!("http://{addr}/app.js")).unwrap(),
+    ];
+
+    let client = test_reqwest_client();
+    let mut scan_args = minimal_scan_args();
+    scan_args.exclude_url = vec!["vendor\\.js".to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let results = fetch_external_scripts(urls, &client, &scan_args, &mut seen).await;
+
+    assert_eq!(results.len(), 1, "excluded script must be skipped");
+    assert!(
+        results[0].0.contains("app.js"),
+        "only app.js should be fetched, got {:?}",
+        results[0].0
+    );
+}
+
+#[tokio::test]
+async fn test_fetch_external_scripts_include_url() {
+    use axum::{Router, routing::get};
+    use std::net::Ipv4Addr;
+
+    let app = Router::new().route("/{*path}", get(|| async { "var x = 1;" }));
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    // Three scripts: only app.js matches the include pattern
+    let urls = vec![
+        url::Url::parse(&format!("http://{addr}/vendor.js")).unwrap(),
+        url::Url::parse(&format!("http://{addr}/app.js")).unwrap(),
+        url::Url::parse(&format!("http://{addr}/runtime.js")).unwrap(),
+    ];
+
+    let client = test_reqwest_client();
+    let mut scan_args = minimal_scan_args();
+    scan_args.include_url = vec!["app\\.js".to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let results = fetch_external_scripts(urls, &client, &scan_args, &mut seen).await;
+
+    assert_eq!(results.len(), 1, "only the included script should be fetched");
+    assert!(
+        results[0].0.contains("app.js"),
+        "only app.js should be fetched, got {:?}",
+        results[0].0
+    );
+}

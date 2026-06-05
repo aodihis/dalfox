@@ -58,9 +58,17 @@ Submit a scan. Returns immediately.
   "blind_callback_url": "https://callback.example",
   "deep_scan": false,
   "skip_ast_analysis": false,
+  "analyze_external_js": false,
   "detect_outdated_libs": false
 }
 ```
+
+`analyze_external_js` is opt-in (default `false`): set it `true` to fetch and
+AST-analyze same-origin `<script src>` bundles for DOM-XSS. This extends
+coverage to SPA/bundled apps where sink logic lives in external files rather
+than inline scripts. Each scan is capped at 10 scripts and 2 MB total to
+preserve request budget. Findings from external bundles include an
+`[external: <url>]` tag in their evidence string.
 
 `detect_outdated_libs` is opt-in (default `false`): set it `true` to also emit
 informational `[I]` findings for outdated / known-vulnerable JS libraries

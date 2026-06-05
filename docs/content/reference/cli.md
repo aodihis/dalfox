@@ -152,6 +152,7 @@ dalfox scan [TARGETS]... [FLAGS]
 | `--sxss-retries` | — | `3` | Retries on the retrieval URL when fetching stored output |
 | `--max-payloads-per-param` | — | `0` | Cap payloads tested per parameter (`0` = no cap) |
 | `--skip-ast-analysis` | — | false | Skip AST DOM-XSS |
+| `--analyze-external-js` | — | false | Fetch and AST-analyze same-origin `<script src>` bundles for DOM-XSS (capped at 10 scripts × 2 MB per scan) |
 | `--hpp` | — | false | HTTP Parameter Pollution |
 | `--detect-outdated-libs` | — | false | Also report outdated / known-vulnerable JS libraries (informational, CWE-1104; 0 extra requests) |
 

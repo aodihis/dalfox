@@ -86,6 +86,7 @@ All flags are defined in `src/cmd/scan.rs:ScanArgs`. Defaults are centralized in
 | `--max-payloads-per-param` | 0 (unlimited) | Hard cap on payloads per parameter |
 | `--skip-xss-scanning` | false | Discovery only (different from `--only-discovery`) |
 | `--skip-ast-analysis` | false | Disable oxc-based DOM XSS detection |
+| `--analyze-external-js` | false | Fetch and AST-analyze same-origin `<script src>` bundles for DOM-XSS (10 scripts × 2 MB cap) |
 | `--hpp` | false | HTTP Parameter Pollution (duplicate query params) |
 
 ## Stored XSS (SXSS)
