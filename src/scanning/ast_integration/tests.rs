@@ -906,9 +906,7 @@ async fn test_fetch_external_scripts_count_cap() {
     });
 
     let urls: Vec<url::Url> = (0..15)
-        .map(|i| {
-            url::Url::parse(&format!("http://{addr}/script{i}.js")).unwrap()
-        })
+        .map(|i| url::Url::parse(&format!("http://{addr}/script{i}.js")).unwrap())
         .collect();
 
     let client = test_reqwest_client();
@@ -1024,7 +1022,11 @@ async fn test_fetch_external_scripts_include_url() {
     let mut seen = std::collections::HashSet::new();
     let results = fetch_external_scripts(urls, &client, &scan_args, &mut seen).await;
 
-    assert_eq!(results.len(), 1, "only the included script should be fetched");
+    assert_eq!(
+        results.len(),
+        1,
+        "only the included script should be fetched"
+    );
     assert!(
         results[0].0.contains("app.js"),
         "only app.js should be fetched, got {:?}",

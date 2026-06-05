@@ -2836,10 +2836,7 @@ async fn ext_js_bundle_handler(
 
 /// Run a scan against a local server that serves an external JS bundle.
 /// Returns the findings array from the JSON output.
-async fn run_ext_js_scan(
-    addr: SocketAddr,
-    analyze_external_js: bool,
-) -> Vec<serde_json::Value> {
+async fn run_ext_js_scan(addr: SocketAddr, analyze_external_js: bool) -> Vec<serde_json::Value> {
     let target = format!("http://{}:{}/?q=seed", addr.ip(), addr.port());
     let out_path = std::env::temp_dir().join(format!(
         "dalfox_extjs_{}_{}_{}.json",
