@@ -41,9 +41,11 @@ use rmcp::{
 use crate::{
     cmd::scan::ScanArgs,
     job::{
-        AbortOnDrop, JOB_RETENTION_SECS, Job, JobStatus, MAX_DELAY_MS, MAX_TIMEOUT_SECS,
-        MAX_WORKERS, has_http_scheme, now_ms, parse_job_status,
-        purge_expired_jobs as purge_jobs_map, send_reachability_probe, unreachable_error_message,
+        AbortOnDrop, JOB_RETENTION_SECS, Job, JobStatus, MAX_ACTIVE_SCANS_MCP, MAX_DELAY_MS,
+        MAX_DISCOVERED_PARAMS, MAX_SCAN_TIMEOUT_SECS, MAX_TIMEOUT_SECS, MAX_WORKERS,
+        cap_reflection_params, has_http_scheme, now_ms, parse_job_status,
+        purge_expired_jobs as purge_jobs_map, run_within_scan_budget, send_reachability_probe,
+        split_cookie_pairs, unreachable_error_message,
     },
     parameter_analysis::analyze_parameters,
     scanning::result::{Result as ScanResult, SanitizedResult},
@@ -275,17 +277,19 @@ impl DalfoxMcp {
                 t.ignore_return = scan_args.ignore_return.clone();
                 t.workers = scan_args.workers;
                 t.user_agent = scan_args.user_agent.clone();
+                // Parse via the shared helpers so MCP matches the REST server:
+                // empty header names are rejected, and each cookie entry is
+                // `;`-split + trimmed (a bare split_once would keep whitespace
+                // and fold `a=b; c=d` into one value).
                 t.headers = scan_args
                     .headers
                     .iter()
-                    .filter_map(|h| h.split_once(':'))
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    .filter_map(|h| crate::utils::http::parse_header_line(h))
                     .collect();
                 t.cookies = scan_args
                     .cookies
                     .iter()
-                    .filter_map(|c| c.split_once('='))
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .flat_map(|c| split_cookie_pairs(c))
                     .collect();
                 t.data = scan_args.data.clone();
                 t
@@ -346,8 +350,12 @@ impl DalfoxMcp {
             }
         }));
 
-        crate::REQUEST_COUNT_JOB
-            .scope(progress.requests_sent.clone(), async {
+        // Captured from inside the scoped/async blocks below so the worker-panic
+        // count survives past the scan; assigned by the run_scanning call.
+        let mut scan_report = crate::scanning::ScanRunReport::default();
+        let scan_fut = crate::with_job_rate_limiter(
+            scan_args.rate_limit,
+            crate::REQUEST_COUNT_JOB.scope(progress.requests_sent.clone(), async {
                 crate::WAF_CONSECUTIVE_BLOCKS_JOB
                     .scope(job_waf_consecutive.clone(), async {
                         // Dispatch blind-XSS probes when a callback URL was
@@ -396,13 +404,27 @@ impl DalfoxMcp {
                         // Parameter discovery / mining
                         analyze_parameters(&mut target, scan_args.as_ref(), None).await;
 
+                        // Bound the per-scan fan-out: a sprawling/hostile target
+                        // can expose thousands of params, and scanning spawns
+                        // O(params × payloads) workers. Truncate past the cap.
+                        let dropped = cap_reflection_params(&mut target);
+                        if dropped > 0 {
+                            Self::log(
+                                "WRN",
+                                &format!(
+                                    "scan_id={} discovered params capped to {} (dropped {})",
+                                    scan_id, MAX_DISCOVERED_PARAMS, dropped
+                                ),
+                            );
+                        }
+
                         // Record discovered param count
                         progress.params_total.store(
                             target.reflection_params.len() as u32,
                             std::sync::atomic::Ordering::Relaxed,
                         );
 
-                        crate::scanning::run_scanning(
+                        scan_report = crate::scanning::run_scanning(
                             &target,
                             scan_args.clone(),
                             results_arc.clone(),
@@ -420,8 +442,15 @@ impl DalfoxMcp {
                         .await;
                     })
                     .await;
-            })
-            .await;
+            }),
+        );
+
+        // Enforce the whole-scan wall-clock budget. On expiry the cancel flag is
+        // tripped so in-flight workers wind down at their next checkpoint and
+        // the job settles as `cancelled` with partial results, mirroring a user
+        // cancel — plus an error_message below so a timeout stays distinguishable.
+        let timed_out =
+            run_within_scan_budget(scan_args.scan_timeout, &cancel_flag, scan_fut).await;
 
         drop(findings_updater);
 
@@ -456,14 +485,39 @@ impl DalfoxMcp {
                 .collect::<Vec<_>>()
         };
 
+        // A worker-task panic means a parameter's findings are incomplete;
+        // surface it as `error` (partial results still attached) so a poller
+        // can't mistake a crashed scan for a clean finish. Cancellation wins.
+        let panicked = !was_cancelled && scan_report.worker_panics > 0;
         {
             let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
             if let Some(j) = jobs.get_mut(&scan_id) {
                 // Store partial or complete results
                 j.results = Some(Arc::new(sanitized));
-                // Only update status if not already cancelled (cancel sets status immediately)
+                // Only update status if not already cancelled (cancel sets it
+                // immediately). A scan_timeout trips cancel_flag (so was_cancelled
+                // → Cancelled), a worker panic → Error, otherwise Done.
                 if j.status != JobStatus::Cancelled {
-                    j.status = JobStatus::Done;
+                    j.status = if was_cancelled {
+                        JobStatus::Cancelled
+                    } else if panicked {
+                        JobStatus::Error
+                    } else {
+                        JobStatus::Done
+                    };
+                }
+                // panic and timeout are mutually exclusive (timeout trips the
+                // cancel flag → panicked is false), so record whichever applies.
+                if panicked && j.error_message.is_none() {
+                    j.error_message = Some(format!(
+                        "{} scan worker task(s) panicked; results are partial",
+                        scan_report.worker_panics
+                    ));
+                } else if timed_out && j.error_message.is_none() {
+                    j.error_message = Some(format!(
+                        "scan exceeded scan_timeout ({}s); returning partial results",
+                        scan_args.scan_timeout
+                    ));
                 }
                 // finished_at_ms may already be set by cancel_scan_dalfox; preserve it
                 // so we record the moment the user asked to stop, not when the task noticed.
@@ -475,12 +529,20 @@ impl DalfoxMcp {
 
         let status_label = if was_cancelled {
             "cancelled"
+        } else if panicked {
+            "error"
         } else {
             "finished"
         };
         Self::log(
             "JOB",
-            &format!("scan {} scan_id={} url={}", status_label, scan_id, url),
+            &format!(
+                "scan {}{} scan_id={} url={}",
+                status_label,
+                if timed_out { " (scan_timeout)" } else { "" },
+                scan_id,
+                url
+            ),
         );
     }
 }
@@ -541,6 +603,14 @@ pub struct ScanWithDalfoxParams {
     #[schemars(range(min = 1, max = 299))]
     pub timeout: u64,
 
+    /// Whole-scan wall-clock budget in seconds (0-86400). When the budget is
+    /// reached the scan stops, returns whatever partial results it gathered, and
+    /// settles as `cancelled` with an error_message noting the timeout. 0 = no
+    /// budget (unbounded). Use this to bound long/deep scans. Default: 0
+    #[serde(default)]
+    #[schemars(range(max = 86400))]
+    pub scan_timeout: u64,
+
     /// Delay between requests in milliseconds (0-9999). Default: 0
     #[serde(default)]
     #[schemars(range(max = 9999))]
@@ -596,6 +666,12 @@ pub struct ScanWithDalfoxParams {
     #[serde(default = "default_workers")]
     #[schemars(range(min = 1, max = 500))]
     pub workers: usize,
+
+    /// Cap the scan's outbound request rate (requests/second). 0 = unlimited
+    /// (the default). Use this to be gentle on a fragile target or to stay
+    /// under a WAF's threshold. Now enforced across all worker tasks.
+    #[serde(default)]
+    pub rate_limit: u32,
 }
 
 fn default_method() -> String {
@@ -655,7 +731,10 @@ pub struct PreflightDalfoxParams {
     /// Target URL to analyze. Must start with http:// or https://.
     pub target: String,
 
-    /// Specific parameters to test. Supports location hints via "name:location" syntax.
+    /// Accepted for symmetry with scan_with_dalfox but NOT used by preflight:
+    /// preflight always reports the full auto-discovered parameter set (the
+    /// impact estimate), matching the REST `/preflight` endpoint. Pass the
+    /// filter to scan_with_dalfox when you actually run the scan.
     #[serde(default)]
     pub param: Vec<String>,
 
@@ -736,6 +815,7 @@ Final results (via get_results_dalfox) include finding type \
             user_agent,
             encoders,
             timeout,
+            scan_timeout,
             delay,
             follow_redirects,
             proxy,
@@ -749,6 +829,7 @@ Final results (via get_results_dalfox) include finding type \
             analyze_external_js,
             blind_callback_url,
             workers,
+            rate_limit,
         } = params;
 
         let target = target.trim().to_string();
@@ -792,6 +873,15 @@ Final results (via get_results_dalfox) include finding type \
                 None,
             ));
         }
+        if scan_timeout > MAX_SCAN_TIMEOUT_SECS {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "scan_timeout must be between 0 and {} seconds (got {})",
+                    MAX_SCAN_TIMEOUT_SECS, scan_timeout
+                ),
+                None,
+            ));
+        }
 
         // Reserve a unique scan_id and insert the queued job under a single
         // lock. `make_scan_id` mixes in a nanosecond nonce, so collisions are
@@ -801,8 +891,22 @@ Final results (via get_results_dalfox) include finding type \
         // its entry is replaced, so its poller starts seeing a different
         // scan's results). Regenerating on collision makes the guarantee
         // explicit and cheap.
+        // Enforce a concurrency cap and reserve the scan_id under one lock.
+        // MCP has no config surface, so the bound is a constant; submissions
+        // past it are rejected so an agent loop can't grow the job map /
+        // blocking pool without bound.
         let scan_id = {
             let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
+            let active = jobs.values().filter(|j| !j.is_terminal()).count();
+            if active >= MAX_ACTIVE_SCANS_MCP {
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "at capacity: {} scans already active (max {}); wait for some to finish or cancel/delete them",
+                        active, MAX_ACTIVE_SCANS_MCP
+                    ),
+                    None,
+                ));
+            }
             let id = crate::utils::make_unique_scan_id(&target, |id| jobs.contains_key(id));
             jobs.insert(id.clone(), Job::new_queued(target.clone()));
             id
@@ -830,7 +934,12 @@ Final results (via get_results_dalfox) include finding type \
         // see the comment on `ScanWithDalfoxParams::cookies` for the reason.
         let scan_args = Arc::new(ScanArgs {
             detect_outdated_libs,
-            analyze_external_js,
+            // One MCP scan call targets exactly one URL, with method/headers/
+            // cookies/data supplied as explicit fields — the same per-request
+            // fidelity a single HAR entry carries. The fan-out input shapes
+            // (`file`, `pipe`, `raw-http`, `har`) stay CLI-only because they
+            // expand one input into many targets, which this single-target tool
+            // doesn't model; an agent replays a HAR by calling the tool per entry.
             input_type: "url".to_string(),
             format: "json".to_string(),
             targets: vec![target.clone()],
@@ -856,7 +965,10 @@ Final results (via get_results_dalfox) include finding type \
             skip_reflection_cookie: false,
             skip_reflection_path: false,
             timeout,
-            scan_timeout: 0,
+            // Whole-scan wall-clock budget; 0 = unbounded. Enforced in
+            // `run_job` by wrapping the scan future (run_scanning doesn't honor
+            // this field — the CLI applies the same budget in its scan loop).
+            scan_timeout,
             delay,
             proxy,
             follow_redirects,
@@ -872,7 +984,9 @@ Final results (via get_results_dalfox) include finding type \
             limit: None,
             limit_result_type: "all".to_string(),
             only_poc: vec![],
-            no_color: false,
+            // Match the REST server: scan output is silenced and serialized as
+            // JSON, so strip ANSI from any diagnostic the pipeline emits.
+            no_color: true,
             workers,
             max_concurrent_targets: 50,
             max_targets_per_host: 100,
@@ -897,7 +1011,14 @@ Final results (via get_results_dalfox) include finding type \
             skip_waf_probe: false,
             force_waf: None,
             waf_evasion: false,
-            waf_min_confidence: 0.0,
+            // Per-call request-rate cap, now honored across all worker tasks
+            // (see crate::with_job_scopes). 0 = unlimited.
+            rate_limit,
+            retries: 0,
+            retry_delay: 1000,
+            // Match the server/CLI default so MCP doesn't surface low-confidence
+            // WAF fingerprints the other front-ends filter out (was 0.0).
+            waf_min_confidence: crate::cmd::scan::DEFAULT_WAF_MIN_CONFIDENCE,
             remote_payloads: vec![],
             remote_wordlists: vec![],
         });
@@ -1030,10 +1151,12 @@ Call this repeatedly until status is 'done', 'error', or 'cancelled'."
                 if let Some(ref err_msg) = snap.error_message {
                     out["error_message"] = serde_json::json!(err_msg);
                 }
-                // Include progress info when scan is running, done, or cancelled
+                // Include progress for running/terminal jobs — Error too, so an
+                // early infra failure still exposes any params/requests counted
+                // before it failed instead of an opaque error_message alone.
                 if matches!(
                     snap.status,
-                    JobStatus::Running | JobStatus::Done | JobStatus::Cancelled
+                    JobStatus::Running | JobStatus::Done | JobStatus::Cancelled | JobStatus::Error
                 ) {
                     let params_total = snap
                         .progress
@@ -1053,36 +1176,40 @@ Call this repeatedly until status is 'done', 'error', or 'cancelled'."
                         .load(std::sync::atomic::Ordering::Relaxed);
 
                     // Estimate completion percentage from params tested vs total
-                    let estimated_completion_pct: u32 =
-                        if matches!(snap.status, JobStatus::Done | JobStatus::Cancelled) {
-                            if snap.status == JobStatus::Done {
-                                100
-                            } else if params_total > 0 {
-                                ((params_tested as f64 / params_total as f64) * 100.0) as u32
-                            } else {
-                                0
-                            }
+                    let estimated_completion_pct: u32 = if matches!(
+                        snap.status,
+                        JobStatus::Done | JobStatus::Cancelled | JobStatus::Error
+                    ) {
+                        if snap.status == JobStatus::Done {
+                            100
                         } else if params_total > 0 {
-                            ((params_tested as f64 / params_total as f64) * 100.0).min(99.0) as u32
+                            ((params_tested as f64 / params_total as f64) * 100.0) as u32
                         } else {
                             0
-                        };
+                        }
+                    } else if params_total > 0 {
+                        ((params_tested as f64 / params_total as f64) * 100.0).min(99.0) as u32
+                    } else {
+                        0
+                    };
 
                     // Suggest poll interval based on progress:
                     // - queued/early: poll every 2s
                     // - mid-scan: poll every 3s
                     // - near completion (>80%): poll every 1s
                     // - done/cancelled: no more polling needed
-                    let suggested_poll_interval_ms: u64 =
-                        if matches!(snap.status, JobStatus::Done | JobStatus::Cancelled) {
-                            0
-                        } else if estimated_completion_pct > 80 {
-                            1000
-                        } else if estimated_completion_pct > 10 {
-                            3000
-                        } else {
-                            2000
-                        };
+                    let suggested_poll_interval_ms: u64 = if matches!(
+                        snap.status,
+                        JobStatus::Done | JobStatus::Cancelled | JobStatus::Error
+                    ) {
+                        0
+                    } else if estimated_completion_pct > 80 {
+                        1000
+                    } else if estimated_completion_pct > 10 {
+                        3000
+                    } else {
+                        2000
+                    };
 
                     out["progress"] = serde_json::json!({
                         "params_total": params_total,
@@ -1210,17 +1337,17 @@ Use before scan_with_dalfox to estimate scan impact and verify reachability."
                 t.proxy = params.proxy.clone();
                 t.follow_redirects = params.follow_redirects;
                 t.user_agent = params.user_agent.clone();
+                // Shared parsers: reject empty header names and `;`-split +
+                // trim each cookie, matching the scan path and the REST server.
                 t.headers = params
                     .headers
                     .iter()
-                    .filter_map(|h| h.split_once(":"))
-                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    .filter_map(|h| crate::utils::http::parse_header_line(h))
                     .collect();
                 t.cookies = params
                     .cookies
                     .iter()
-                    .filter_map(|c| c.split_once('='))
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .flat_map(|c| split_cookie_pairs(c))
                     .collect();
                 t.data = params.data.clone();
                 t
@@ -1233,10 +1360,13 @@ Use before scan_with_dalfox to estimate scan impact and verify reachability."
             }
         };
 
-        // Build minimal ScanArgs for parameter analysis only
+        // Build minimal ScanArgs for parameter analysis only.
+        // `param: vec![]` so preflight reports the FULL discovered set (impact
+        // estimate), matching the REST server's /preflight — passing the
+        // client's `param` filter here would under-report discovery.
         let scan_args = ScanArgs::for_preflight(crate::cmd::scan::PreflightOptions {
             target: target_url.clone(),
-            param: params.param.clone(),
+            param: vec![],
             method: params.method.clone(),
             data: params.data.clone(),
             headers: params.headers.clone(),
@@ -1279,6 +1409,9 @@ Use before scan_with_dalfox to estimate scan impact and verify reachability."
                     }
 
                     analyze_parameters(&mut target, &scan_args, None).await;
+                    // Apply the same per-scan parameter cap a real scan would,
+                    // so the estimate reflects what scanning actually fans out to.
+                    cap_reflection_params(&mut target);
 
                     // Estimate request count (encoder expansion factor)
                     let enc_factor = if scan_args.encoders.iter().any(|e| e == "none") {

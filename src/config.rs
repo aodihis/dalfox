@@ -91,6 +91,9 @@ pub struct ScanConfig {
     pub timeout: Option<u64>,
     pub scan_timeout: Option<u64>,
     pub delay: Option<u64>,
+    pub rate_limit: Option<u32>,
+    pub retries: Option<u32>,
+    pub retry_delay: Option<u64>,
     pub proxy: Option<String>,
     pub follow_redirects: Option<bool>,
     pub ignore_return: Option<Vec<u16>>,
@@ -259,6 +262,15 @@ impl Config {
             }
             if let Some(v) = scan.delay {
                 args.delay = v;
+            }
+            if let Some(v) = scan.rate_limit {
+                args.rate_limit = v;
+            }
+            if let Some(v) = scan.retries {
+                args.retries = v;
+            }
+            if let Some(v) = scan.retry_delay {
+                args.retry_delay = v;
             }
             if let Some(v) = &scan.proxy {
                 args.proxy = Some(v.clone());
@@ -669,6 +681,21 @@ impl Config {
             {
                 args.delay = v;
             }
+            if let Some(v) = scan.rate_limit
+                && args.rate_limit == crate::cmd::scan::DEFAULT_RATE_LIMIT
+            {
+                args.rate_limit = v;
+            }
+            if let Some(v) = scan.retries
+                && args.retries == crate::cmd::scan::DEFAULT_RETRIES
+            {
+                args.retries = v;
+            }
+            if let Some(v) = scan.retry_delay
+                && args.retry_delay == crate::cmd::scan::DEFAULT_RETRY_DELAY_MS
+            {
+                args.retry_delay = v;
+            }
             if let Some(v) = &scan.proxy
                 && args.proxy.is_none()
             {
@@ -936,7 +963,7 @@ pub fn default_toml_template() -> String {
 
 [scan]
 # INPUT
-# input_type = "auto"        # auto, url, file, pipe, raw-http (parses raw HTTP request file or literal)
+# input_type = "auto"        # auto, url, file, pipe, raw-http (parses raw HTTP request file or literal), har (HAR / proxy export)
 
 # OUTPUT
 # format = "plain"           # plain, json, jsonl, markdown, sarif, toml

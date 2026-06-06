@@ -225,6 +225,12 @@ pub(crate) async fn run_scan_job(
 
     let args = ScanArgs {
         detect_outdated_libs: opts.detect_outdated_libs.unwrap_or(false),
+        // Each REST job scans exactly one caller-supplied URL, with method,
+        // headers, cookies, and body provided as explicit request fields — the
+        // same fidelity a single HAR entry carries. The multi-target input
+        // shapes (`file`, `pipe`, `raw-http`, `har`) are CLI-only because they
+        // fan one input out into many targets, which the one-job-one-URL model
+        // here doesn't express; callers replay a HAR by POSTing /scan per entry.
         analyze_external_js: opts.analyze_external_js.unwrap_or(false),
         input_type: "url".to_string(),
         format: "json".to_string(),
@@ -276,7 +282,11 @@ pub(crate) async fn run_scan_job(
         timeout: opts
             .timeout
             .unwrap_or(crate::cmd::scan::DEFAULT_TIMEOUT_SECS),
-        scan_timeout: 0,
+        // Whole-scan wall-clock budget: the request's own value, capped by the
+        // server-wide `--scan-timeout` when set. Enforced below by wrapping the
+        // scan future, since `run_scanning` itself doesn't honor this field
+        // (the CLI applies the same budget in its scan loop, not in scanning).
+        scan_timeout: effective_scan_timeout(opts.scan_timeout, state.scan_timeout),
         delay: opts.delay.unwrap_or(0),
         proxy: opts.proxy.clone(),
         follow_redirects: opts.follow_redirects.unwrap_or(false),
@@ -312,6 +322,12 @@ pub(crate) async fn run_scan_job(
         skip_waf_probe: false,
         force_waf: None,
         waf_evasion: false,
+        // Per-scan outbound request rate (RPS), capped by the server-wide
+        // `--rate-limit`. Honored in `run_scanning`'s workers now that they
+        // re-enter the per-job rate-limiter scope (see crate::with_job_scopes).
+        rate_limit: effective_rate_limit(opts.rate_limit, state.rate_limit),
+        retries: 0,
+        retry_delay: 1000,
         waf_min_confidence: crate::cmd::scan::DEFAULT_WAF_MIN_CONFIDENCE,
         remote_payloads: opts.remote_payloads.clone().unwrap_or_default(),
         remote_wordlists: opts.remote_wordlists.clone().unwrap_or_default(),
@@ -424,8 +440,12 @@ pub(crate) async fn run_scan_job(
         }
     }));
 
-    crate::REQUEST_COUNT_JOB
-        .scope(progress.requests_sent.clone(), async {
+    // Captured from inside the scoped/async blocks below so worker-panic count
+    // survives past the scan; assigned by the run_scanning call.
+    let mut scan_report = crate::scanning::ScanRunReport::default();
+    let scan_fut = crate::with_job_rate_limiter(
+        args.rate_limit,
+        crate::REQUEST_COUNT_JOB.scope(progress.requests_sent.clone(), async {
             crate::WAF_CONSECUTIVE_BLOCKS_JOB
                 .scope(job_waf_consecutive.clone(), async {
                     if let Some(callback_url) = &args.blind_callback_url {
@@ -469,12 +489,27 @@ pub(crate) async fn run_scan_job(
                     silent_args.silence = true;
                     analyze_parameters(&mut target, &silent_args, None).await;
 
+                    // Bound the per-scan fan-out: a sprawling/hostile target can
+                    // expose thousands of params, and scanning spawns O(params ×
+                    // payloads) workers. Truncate with a warning past the cap.
+                    let dropped = cap_reflection_params(&mut target);
+                    if dropped > 0 {
+                        log(
+                            &state,
+                            "WRN",
+                            &format!(
+                                "id={} discovered params capped to {} (dropped {})",
+                                job_id, MAX_DISCOVERED_PARAMS, dropped
+                            ),
+                        );
+                    }
+
                     progress.params_total.store(
                         target.reflection_params.len() as u32,
                         std::sync::atomic::Ordering::Relaxed,
                     );
 
-                    crate::scanning::run_scanning(
+                    scan_report = crate::scanning::run_scanning(
                         &target,
                         Arc::new(args.clone()),
                         results.clone(),
@@ -491,8 +526,14 @@ pub(crate) async fn run_scan_job(
                     .await;
                 })
                 .await;
-        })
-        .await;
+        }),
+    );
+
+    // Enforce the whole-scan wall-clock budget. On expiry the cancel flag is
+    // tripped so any in-flight workers wind down at their next checkpoint, and
+    // the job settles as `cancelled` with whatever partial results it gathered
+    // (plus an explanatory error_message) — the same shape as a user cancel.
+    let timed_out = run_within_scan_budget(args.scan_timeout, &cancel_flag, scan_fut).await;
 
     drop(findings_updater);
 
@@ -523,6 +564,11 @@ pub(crate) async fn run_scan_job(
             .collect::<Vec<_>>()
     };
 
+    // A worker-task panic means at least one parameter's findings are
+    // incomplete. Surface that as `error` (with the partial results still
+    // attached) so a poller can't mistake a crashed scan for a clean `done`.
+    // Cancellation takes precedence (it's already a partial-by-design state).
+    let panicked = !was_cancelled && scan_report.worker_panics > 0;
     let final_results_arc = Arc::new(final_results);
     let callback_url = {
         let mut jobs = state.jobs.lock().await;
@@ -532,9 +578,26 @@ pub(crate) async fn run_scan_job(
             if job.status != JobStatus::Cancelled {
                 job.status = if was_cancelled {
                     JobStatus::Cancelled
+                } else if panicked {
+                    JobStatus::Error
                 } else {
                     JobStatus::Done
                 };
+            }
+            // A worker panic and a scan_timeout are mutually exclusive (a
+            // timeout trips the cancel flag, so `panicked` is false then), so a
+            // simple if/else-if records whichever applies without clobbering an
+            // error_message a prior path already set.
+            if panicked && job.error_message.is_none() {
+                job.error_message = Some(format!(
+                    "{} scan worker task(s) panicked; results are partial",
+                    scan_report.worker_panics
+                ));
+            } else if timed_out && job.error_message.is_none() {
+                job.error_message = Some(format!(
+                    "scan exceeded scan_timeout ({}s); returning partial results",
+                    args.scan_timeout
+                ));
             }
             // Preserve an earlier finished_at_ms set by cancel_scan_handler
             // (which records when the user asked to stop, not when the task noticed).
@@ -546,11 +609,23 @@ pub(crate) async fn run_scan_job(
             None
         }
     };
-    let status_label = if was_cancelled { "cancelled" } else { "done" };
+    let status_label = if was_cancelled {
+        "cancelled"
+    } else if panicked {
+        "error"
+    } else {
+        "done"
+    };
     log(
         &state,
         "JOB",
-        &format!("{} id={} url={}", status_label, job_id, url),
+        &format!(
+            "{}{} id={} url={}",
+            status_label,
+            if timed_out { " (scan_timeout)" } else { "" },
+            job_id,
+            url
+        ),
     );
 
     // Reuse the target's HTTP configuration (proxy, TLS relaxation, redirect
@@ -635,13 +710,14 @@ pub(crate) fn hydrate_preflight_target(
     t.user_agent = opts.user_agent.clone();
     t.proxy = opts.proxy.clone();
     t.follow_redirects = opts.follow_redirects.unwrap_or(false);
+    // Parse via the shared helper so preflight rejects empty header names the
+    // same way the scan path does (a bare `:value` is dropped, not forwarded).
     t.headers = opts
         .header
         .as_ref()
         .map(|h| {
             h.iter()
-                .filter_map(|s| s.split_once(":"))
-                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .filter_map(|s| crate::utils::http::parse_header_line(s))
                 .collect()
         })
         .unwrap_or_default();

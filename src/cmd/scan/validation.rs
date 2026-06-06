@@ -2,7 +2,10 @@
 //! validation, the URL-vs-file-path tiebreak, target-list extension
 //! detection, and out-of-scope domain matching. Pure functions, no I/O.
 
-use super::args::{CLI_MAX_DELAY_MS, CLI_MAX_TIMEOUT_SECS, CLI_MAX_WORKERS, ScanArgs};
+use super::args::{
+    CLI_MAX_DELAY_MS, CLI_MAX_RATE_LIMIT, CLI_MAX_RETRIES, CLI_MAX_RETRY_DELAY_MS,
+    CLI_MAX_TIMEOUT_SECS, CLI_MAX_WORKERS, ScanArgs,
+};
 
 /// Check if a domain matches an out-of-scope pattern.
 /// Supports simple wildcard: `*.example.com` matches `sub.example.com` but not `notexample.com`.
@@ -67,6 +70,40 @@ pub(crate) fn validate_numeric_args(
             format!(
                 "--delay must be at most {} ms (got {})",
                 CLI_MAX_DELAY_MS, args.delay
+            ),
+        ));
+    }
+    // The rate-limit / retry caps below intentionally reuse
+    // `INVALID_INPUT_TYPE`, the same code every other numeric range check in
+    // this function emits (workers, timeout, delay, …). Keeping one code for
+    // "a numeric arg was out of range" means structured-output (JSON/JSONL/
+    // SARIF) consumers can match a single, stable category for all of them
+    // rather than a per-flag taxonomy; the human-facing message carries the
+    // specific flag and bound.
+    if args.rate_limit > CLI_MAX_RATE_LIMIT {
+        return Err((
+            crate::cmd::error_codes::INVALID_INPUT_TYPE,
+            format!(
+                "--rate-limit must be at most {} req/sec (got {}); use 0 for unlimited",
+                CLI_MAX_RATE_LIMIT, args.rate_limit
+            ),
+        ));
+    }
+    if args.retries > CLI_MAX_RETRIES {
+        return Err((
+            crate::cmd::error_codes::INVALID_INPUT_TYPE,
+            format!(
+                "--retries must be at most {} (got {})",
+                CLI_MAX_RETRIES, args.retries
+            ),
+        ));
+    }
+    if args.retry_delay > CLI_MAX_RETRY_DELAY_MS {
+        return Err((
+            crate::cmd::error_codes::INVALID_INPUT_TYPE,
+            format!(
+                "--retry-delay must be at most {} ms (got {})",
+                CLI_MAX_RETRY_DELAY_MS, args.retry_delay
             ),
         ));
     }
@@ -153,7 +190,7 @@ pub(crate) fn looks_like_url_input(s: &str) -> bool {
 pub(crate) fn looks_like_target_list_filename(s: &str) -> bool {
     const EXTS: &[&str] = &[
         "txt", "list", "lst", "csv", "tsv", "log", "json", "jsonl", "ndjson", "yaml", "yml",
-        "conf", "cfg", "ini", "req", "raw", "http",
+        "conf", "cfg", "ini", "req", "raw", "http", "har",
     ];
     s.rsplit('.')
         .next()
@@ -214,6 +251,7 @@ mod input_shape_tests {
         assert!(looks_like_target_list_filename("data.csv"));
         assert!(looks_like_target_list_filename("out.JSONL"));
         assert!(looks_like_target_list_filename("req.HTTP"));
+        assert!(looks_like_target_list_filename("capture.har"));
         // A bare host has no recognized list extension.
         assert!(!looks_like_target_list_filename("example.com"));
         assert!(!looks_like_target_list_filename("noext"));

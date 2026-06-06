@@ -4,7 +4,8 @@ use super::poc::{build_ast_dom_message, generate_poc, render_finding_block};
 use super::postprocess::{dedupe_ast_results, extract_context};
 use super::preflight::{PreflightOutcome, is_allowed_content_type, preflight_content_type};
 use super::{
-    CLI_MAX_DELAY_MS, CLI_MAX_TIMEOUT_SECS, CLI_MAX_WORKERS, DEFAULT_DELAY_MS, DEFAULT_ENCODERS,
+    CLI_MAX_DELAY_MS, CLI_MAX_RATE_LIMIT, CLI_MAX_RETRIES, CLI_MAX_RETRY_DELAY_MS,
+    CLI_MAX_TIMEOUT_SECS, CLI_MAX_WORKERS, DEFAULT_DELAY_MS, DEFAULT_ENCODERS,
     DEFAULT_MAX_CONCURRENT_TARGETS, DEFAULT_MAX_TARGETS_PER_HOST, DEFAULT_METHOD,
     DEFAULT_TIMEOUT_SECS, DEFAULT_WORKERS, ScanArgs, ScanOutcome, ScanState, validate_numeric_args,
 };
@@ -92,6 +93,9 @@ fn default_scan_args() -> ScanArgs {
         skip_waf_probe: false,
         force_waf: None,
         waf_evasion: false,
+        rate_limit: 0,
+        retries: 0,
+        retry_delay: 1000,
         waf_min_confidence: 0.0,
         targets: vec![],
     }
@@ -178,6 +182,44 @@ fn validate_numeric_args_rejects_zero_concurrent_targets() {
     let mut args = default_scan_args();
     args.max_concurrent_targets = 0;
     assert!(validate_numeric_args(&args).is_err());
+}
+
+#[test]
+fn validate_numeric_args_accepts_rate_limit_and_retries() {
+    let mut args = default_scan_args();
+    // 0 (unlimited / off) and reasonable values all validate.
+    args.rate_limit = 0;
+    args.retries = 0;
+    args.retry_delay = DEFAULT_DELAY_MS;
+    assert!(validate_numeric_args(&args).is_ok());
+    args.rate_limit = 20;
+    args.retries = 3;
+    args.retry_delay = 500;
+    assert!(validate_numeric_args(&args).is_ok());
+}
+
+#[test]
+fn validate_numeric_args_rejects_rate_limit_over_cap() {
+    let mut args = default_scan_args();
+    args.rate_limit = CLI_MAX_RATE_LIMIT + 1;
+    let err = validate_numeric_args(&args).unwrap_err();
+    assert!(err.1.contains("rate-limit"), "got: {}", err.1);
+}
+
+#[test]
+fn validate_numeric_args_rejects_retries_over_cap() {
+    let mut args = default_scan_args();
+    args.retries = CLI_MAX_RETRIES + 1;
+    let err = validate_numeric_args(&args).unwrap_err();
+    assert!(err.1.contains("retries"), "got: {}", err.1);
+}
+
+#[test]
+fn validate_numeric_args_rejects_retry_delay_over_cap() {
+    let mut args = default_scan_args();
+    args.retry_delay = CLI_MAX_RETRY_DELAY_MS + 1;
+    let err = validate_numeric_args(&args).unwrap_err();
+    assert!(err.1.contains("retry-delay"), "got: {}", err.1);
 }
 
 #[test]
@@ -1675,4 +1717,200 @@ fn test_emit_error_renders_all_format_branches() {
     super::emit_error("json", crate::cmd::error_codes::NO_TARGETS, "no targets");
     super::emit_error("jsonl", crate::cmd::error_codes::PARSE_ERROR, "bad parse");
     super::emit_error("plain", crate::cmd::error_codes::FILE_READ_ERROR, "io fail");
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// HAR input resolution (issue #1095). These exercise `resolve_targets` end to
+// end — explicit `-i har`, content-based auto-detection, CLI override append,
+// and the shared url|method dedupe — with no network involved.
+// ─────────────────────────────────────────────────────────────────────────
+
+mod har_input {
+    use super::*;
+
+    const TWO_ENTRY_HAR: &str = r#"{"log":{"version":"1.2","entries":[
+        {"request":{"method":"GET","url":"https://demo.test/search?q=1",
+          "headers":[{"name":"Cookie","value":"sid=xyz"}],"cookies":[]}},
+        {"request":{"method":"POST","url":"https://demo.test/comment",
+          "headers":[{"name":"Content-Type","value":"application/x-www-form-urlencoded"}],
+          "cookies":[],
+          "postData":{"mimeType":"application/x-www-form-urlencoded","text":"body=hi"}}}
+    ]}}"#;
+
+    fn write_temp_har(body: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        path.push(format!(
+            "dalfox-har-test-{}-{}.har",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::write(&path, body).expect("write temp HAR");
+        path
+    }
+
+    #[tokio::test]
+    async fn explicit_har_resolves_get_and_post_targets() {
+        let har = write_temp_har(TWO_ENTRY_HAR);
+        let mut args = default_scan_args();
+        args.input_type = "har".to_string();
+        args.targets = vec![har.to_string_lossy().to_string()];
+
+        let targets = super::super::input::resolve_targets(&args)
+            .await
+            .expect("HAR should resolve");
+        let _ = std::fs::remove_file(&har);
+
+        assert_eq!(targets.len(), 2);
+        let get = targets
+            .iter()
+            .find(|t| t.method == "GET")
+            .expect("GET target");
+        assert_eq!(get.url.as_str(), "https://demo.test/search?q=1");
+        assert!(get.cookies.iter().any(|(k, v)| k == "sid" && v == "xyz"));
+        let post = targets
+            .iter()
+            .find(|t| t.method == "POST")
+            .expect("POST target");
+        assert_eq!(post.url.as_str(), "https://demo.test/comment");
+        assert_eq!(post.data.as_deref(), Some("body=hi"));
+    }
+
+    #[tokio::test]
+    async fn auto_detects_har_file_by_content() {
+        // `-i auto` (the default) must route a HAR file to the HAR parser based
+        // on its content, not its extension — the user-facing "auto distinguishes
+        // HAR" requirement.
+        let har = write_temp_har(TWO_ENTRY_HAR);
+        let mut args = default_scan_args();
+        args.input_type = "auto".to_string();
+        args.targets = vec![har.to_string_lossy().to_string()];
+
+        let targets = super::super::input::resolve_targets(&args)
+            .await
+            .expect("auto-detected HAR should resolve");
+        let _ = std::fs::remove_file(&har);
+
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().any(|t| t.method == "GET"));
+        assert!(targets.iter().any(|t| t.method == "POST"));
+    }
+
+    #[tokio::test]
+    async fn cli_header_is_appended_to_every_har_target() {
+        let har = write_temp_har(TWO_ENTRY_HAR);
+        let mut args = default_scan_args();
+        args.input_type = "har".to_string();
+        args.targets = vec![har.to_string_lossy().to_string()];
+        args.headers = vec!["Authorization: Bearer t0ken".to_string()];
+
+        let targets = super::super::input::resolve_targets(&args)
+            .await
+            .expect("HAR should resolve");
+        let _ = std::fs::remove_file(&har);
+
+        assert_eq!(targets.len(), 2);
+        for t in &targets {
+            assert!(
+                t.headers
+                    .iter()
+                    .any(|(k, v)| k == "Authorization" && v == "Bearer t0ken"),
+                "every HAR target should carry the CLI-supplied header, got {:?}",
+                t.headers
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_url_method_entries_are_deduped() {
+        // Two identical GET requests collapse to one via the shared url|method
+        // dedupe; a differing method survives as its own target.
+        let har = r#"{"log":{"entries":[
+            {"request":{"method":"GET","url":"https://demo.test/a?x=1"}},
+            {"request":{"method":"GET","url":"https://demo.test/a?x=1"}},
+            {"request":{"method":"POST","url":"https://demo.test/a?x=1"}}
+        ]}}"#;
+        let path = write_temp_har(har);
+        let mut args = default_scan_args();
+        args.input_type = "har".to_string();
+        args.targets = vec![path.to_string_lossy().to_string()];
+
+        let targets = super::super::input::resolve_targets(&args)
+            .await
+            .expect("HAR should resolve");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(targets.len(), 2, "duplicate GET should be deduped");
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_filter_applies_to_har_targets() {
+        let har = r#"{"log":{"entries":[
+            {"request":{"method":"GET","url":"https://keep.test/a?x=1"}},
+            {"request":{"method":"GET","url":"https://drop.test/b?y=2"}}
+        ]}}"#;
+        let path = write_temp_har(har);
+        let mut args = default_scan_args();
+        args.input_type = "har".to_string();
+        args.targets = vec![path.to_string_lossy().to_string()];
+        args.out_of_scope = vec!["drop.test".to_string()];
+
+        let targets = super::super::input::resolve_targets(&args)
+            .await
+            .expect("HAR should resolve");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url.host_str(), Some("keep.test"));
+    }
+
+    #[tokio::test]
+    async fn auto_detects_large_har_from_prefix_markers() {
+        // A HAR larger than the sniff prefix is still auto-detected because the
+        // `log`/`entries` markers sit at the very start — detection classifies
+        // it from a bounded prefix without reading the whole file.
+        let big_q = "A".repeat(16 * 1024);
+        let har = format!(
+            r#"{{"log":{{"entries":[{{"request":{{"method":"GET","url":"https://demo.test/?q={big_q}"}}}}]}}}}"#
+        );
+        assert!(har.len() > 8 * 1024, "fixture must exceed the sniff prefix");
+        let path = write_temp_har(&har);
+        let mut args = default_scan_args();
+        args.input_type = "auto".to_string();
+        args.targets = vec![path.to_string_lossy().to_string()];
+
+        let targets = super::super::input::resolve_targets(&args)
+            .await
+            .expect("large HAR with leading markers should auto-detect");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].method, "GET");
+    }
+
+    #[tokio::test]
+    async fn explicit_har_parses_when_markers_past_prefix() {
+        // The flip side of prefix sniffing: a HAR that buries `entries` past
+        // the sniff budget won't auto-detect, but `-i har` reads the file in
+        // full and parses it — the documented escape hatch.
+        let pad = " ".repeat(16 * 1024);
+        let har = format!(
+            r#"{{"log":{{"comment":"{pad}","entries":[{{"request":{{"method":"GET","url":"https://demo.test/?q=1"}}}}]}}}}"#
+        );
+        let path = write_temp_har(&har);
+        let mut args = default_scan_args();
+        args.input_type = "har".to_string(); // explicit, not auto
+        args.targets = vec![path.to_string_lossy().to_string()];
+
+        let targets = super::super::input::resolve_targets(&args)
+            .await
+            .expect("explicit -i har should parse regardless of marker position");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].url.as_str(), "https://demo.test/?q=1");
+    }
 }

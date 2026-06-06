@@ -130,6 +130,102 @@ fn job_status_deserializes_from_lowercase_string() {
 }
 
 #[test]
+fn effective_rate_limit_resolves_request_and_cap() {
+    // No request, no cap → unlimited.
+    assert_eq!(effective_rate_limit(None, None), 0);
+    // No request, cap set → the cap applies to everyone.
+    assert_eq!(effective_rate_limit(None, Some(20)), 20);
+    // Cap explicitly 0 → still unlimited.
+    assert_eq!(effective_rate_limit(None, Some(0)), 0);
+    // Request only → used as-is (including an explicit unlimited).
+    assert_eq!(effective_rate_limit(Some(50), None), 50);
+    assert_eq!(effective_rate_limit(Some(0), None), 0);
+    // Request below the cap → request wins (a client may ask for less).
+    assert_eq!(effective_rate_limit(Some(5), Some(20)), 5);
+    // Request above the cap → clamped down to the cap.
+    assert_eq!(effective_rate_limit(Some(100), Some(20)), 20);
+    // Request tries to go unlimited while a cap is set → clamped to the cap.
+    assert_eq!(effective_rate_limit(Some(0), Some(20)), 20);
+}
+
+#[test]
+fn split_cookie_pairs_splits_and_trims_multi_cookie_value() {
+    // The bug F4 fixes: a bare split_once('=') would fold "; lang=en" into the
+    // first value and keep the surrounding whitespace.
+    let pairs = split_cookie_pairs("session = abc ; lang=en");
+    assert_eq!(
+        pairs,
+        vec![
+            ("session".to_string(), "abc".to_string()),
+            ("lang".to_string(), "en".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn job_status_rejects_unknown_variant() {
     assert!(serde_json::from_str::<JobStatus>("\"finished\"").is_err());
+}
+
+#[test]
+fn effective_scan_timeout_resolves_request_and_cap() {
+    // No request, no cap → unbounded.
+    assert_eq!(effective_scan_timeout(None, None), 0);
+    // No request, cap set → the cap applies to everyone.
+    assert_eq!(effective_scan_timeout(None, Some(30)), 30);
+    // No request, cap explicitly 0 → still unbounded (a 0 cap is "no cap").
+    assert_eq!(effective_scan_timeout(None, Some(0)), 0);
+    // Request only → used as-is, including an explicit disable.
+    assert_eq!(effective_scan_timeout(Some(45), None), 45);
+    assert_eq!(effective_scan_timeout(Some(0), None), 0);
+    // Request under the cap → request wins (a client may ask for less).
+    assert_eq!(effective_scan_timeout(Some(10), Some(30)), 10);
+    // Request over the cap → clamped down to the cap (can't exceed it).
+    assert_eq!(effective_scan_timeout(Some(120), Some(30)), 30);
+    // Request tries to disable while a cap is set → clamped up to the cap
+    // (a client cannot opt out of a server-enforced budget).
+    assert_eq!(effective_scan_timeout(Some(0), Some(30)), 30);
+    // Equal values → that value.
+    assert_eq!(effective_scan_timeout(Some(30), Some(30)), 30);
+}
+
+#[tokio::test]
+async fn run_within_scan_budget_trips_and_sets_cancel_on_expiry() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Budget of 1s against a future that would take 3s → must abort at the
+    // budget (~1s), set the cancel flag, and report that it timed out.
+    let timed_out = run_within_scan_budget(1, &cancel, async {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    })
+    .await;
+    assert!(timed_out, "an over-budget scan must report timed_out");
+    assert!(
+        cancel.load(std::sync::atomic::Ordering::Relaxed),
+        "expiry must trip the shared cancel flag so workers wind down"
+    );
+}
+
+#[tokio::test]
+async fn run_within_scan_budget_passes_through_when_under_budget() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    // Completes well inside the budget → no timeout, cancel flag untouched.
+    let timed_out = run_within_scan_budget(5, &cancel, async {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    })
+    .await;
+    assert!(!timed_out, "a scan that finishes in time must not time out");
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn run_within_scan_budget_zero_disables_the_cap() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    // budget_secs == 0 takes the no-cap branch: it just awaits the future and
+    // returns false without ever arming a timer or touching the cancel flag.
+    let timed_out = run_within_scan_budget(0, &cancel, async {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    })
+    .await;
+    assert!(!timed_out, "a 0 budget must never report a timeout");
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
 }
