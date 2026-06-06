@@ -1016,6 +1016,7 @@ Final results (via get_results_dalfox) include finding type \
             rate_limit,
             retries: 0,
             retry_delay: 1000,
+            analyze_external_js,
             // Match the server/CLI default so MCP doesn't surface low-confidence
             // WAF fingerprints the other front-ends filter out (was 0.0).
             waf_min_confidence: crate::cmd::scan::DEFAULT_WAF_MIN_CONFIDENCE,

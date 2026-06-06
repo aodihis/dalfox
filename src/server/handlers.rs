@@ -390,6 +390,9 @@ pub(crate) async fn get_scan_handler(
         deep_scan: Some(deep_scan),
         skip_ast_analysis: Some(skip_ast_analysis),
         detect_outdated_libs: Some(detect_outdated_libs),
+        analyze_external_js: Some(analyze_external_js),
+        rate_limit,
+        scan_timeout,
     };
 
     if let Err(msg) = validate_scan_options(&opts) {
